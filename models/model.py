@@ -1147,6 +1147,7 @@ class PriorGuidedRE(nn.Module):
         self.dr = nn.ModuleList()  # DetailRestorer
         self.downs = nn.ModuleList()
         self.prior_downs = nn.ModuleList()
+        self.prior_r = nn.ModuleList()
         self.up = nn.ModuleList()
         self.fusion = nn.ModuleList()
         self.fc = FeatureContextualizer(ch_in=self.ch_in * 2 ** self.down_depth,
@@ -1164,6 +1165,16 @@ class PriorGuidedRE(nn.Module):
                 nn.Conv2d(self.ch_in * 2 ** (i + 1), self.ch_in * 2 ** i * 2 ** 2, 1, bias=False),
                 nn.PixelShuffle(2)
             ))
+            self.prior_r.append(
+                nn.Sequential(
+                    nn.Conv2d(self.ch_in * 2 ** i, self.ch_in * 2 ** i, 3, 1, 1, groups=self.ch_in * 2 ** i),
+                    nn.Conv2d(self.ch_in * 2 ** i, self.ch_in * 2 ** i, 1),
+                    nn.GELU(),
+                    nn.Conv2d(self.ch_in * 2 ** i, self.ch_in * 2 ** i, 3, 1, 1, groups=self.ch_in * 2 ** i),
+                    nn.Conv2d(self.ch_in * 2 ** i, self.ch_in * 2 ** i, 1),
+                    nn.GELU()
+                )
+            )
 
         for i in range(self.down_depth + 1):
             self.dr.append(DetailRestorer(self.ch_in * 2 ** i))
@@ -1177,8 +1188,8 @@ class PriorGuidedRE(nn.Module):
         for i, (down, prior_down) in enumerate(zip(self.downs, self.prior_downs)):
             low = down(dr_res[i])
             dr_res.append(self.dr[i + 1](low))
+            prior_low = self.prior_r[i](prior_low)
             prior_low = prior_down(prior_low)
-
         fusion_res = []
 
         fusion_res.append(self.fusion[-1](self.fc(dr_res[-1], prior_low)))
