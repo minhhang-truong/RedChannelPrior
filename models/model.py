@@ -939,7 +939,7 @@ def quaternion_conv_rotation(input, zero_kernel, r_weight, i_weight, j_weight, k
 
 
 # Quaternion Block for Feature Contextualizer
-class MAQ(nn.Module):
+'''class MAQ(nn.Module):
     def __init__(self, dim):
         super(MAQ, self).__init__()
         self.branch1 = CrossAttentionTransformer(dim)  # ACT
@@ -964,6 +964,62 @@ class MAQ(nn.Module):
         out = torch.cat((z, x1, x2, x3), 1)
         out = self.qcnn(out)
         out = self.final(out)
+        return out'''
+
+class SFTLayer(nn.Module):
+    def __init__(self, dim):
+        super(SFTLayer, self).__init__()
+        # Mạng con sinh tham số điều biến từ Prior
+        self.sft_net = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(dim, dim * 2, 1) # Output ra gamma và beta
+        )
+
+    def forward(self, x, prior):
+        # prior có kích thước [B, dim, H, W]
+        # x có kích thước [B, dim, H, W]
+        
+        # Sinh tham số scale (gamma) và shift (beta)
+        scale, shift = self.sft_net(prior).chunk(2, dim=1)
+        
+        # Công thức SFT: F = F * (1 + scale) + shift
+        return x * (1 + scale) + shift
+
+class MAQ(nn.Module):
+    def __init__(self, dim):
+        super(MAQ, self).__init__()
+        
+        # 1. Giữ lại Branch 3: Self-Attention Transformer
+        # Giúp ảnh tự học mối quan hệ xa gần trong chính nó
+        self.self_attn = SelfAttentionTransformer(dim) 
+        
+        # 2. Thay Branch 1 & 2 bằng SFT Layer
+        # Nơi RCP (Prior) điều khiển việc khôi phục ảnh
+        self.sft = SFTLayer(dim)
+        
+        # 3. Khối xử lý sau cùng (thay cho QCNN phức tạp cũ)
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.BatchNorm2d(dim),
+            nn.SiLU(inplace=True)
+        )
+
+    def forward(self, x, prior):
+        # Bước 1: Ảnh tự tăng cường đặc trưng bản thân (Logic của Branch 3 cũ)
+        x_self = self.self_attn(x)
+        
+        # Bước 2: Dùng Prior để điều biến đặc trưng ảnh (Logic SFT thay cho Branch 1)
+        # Tại đây, thông tin vật lý từ RCP (độ sâu) được "tiêm" vào feature map
+        x_sft = self.sft(x_self, prior)
+        
+        # Bước 3: Residual Connection
+        # Cộng gộp với input ban đầu để giữ thông tin gốc
+        out = x + x_sft
+        
+        # Tinh chỉnh cuối cùng
+        out = self.final_conv(out)
+        
         return out
 
 
@@ -1125,7 +1181,7 @@ class SPP(nn.Module):
         return self.fusion(torch.cat(out, dim=1))
 
 
-class ColorBalancePrior(nn.Module):
+'''class ColorBalancePrior(nn.Module):
     def __init__(self, ch_in=3):
         super(ColorBalancePrior, self).__init__()
         self.enc = NAFBlock(ch_in)
@@ -1136,7 +1192,52 @@ class ColorBalancePrior(nn.Module):
 
         prior = self.enc(x_mean)
 
-        return prior
+        return prior'''
+
+class RedChannelPrior(nn.Module):
+    def __init__(self, ch_in=3, patch_size=15):
+        super(RedChannelPrior, self).__init__()
+        self.enc = NAFBlock(ch_in)
+        self.patch_size = patch_size
+        self.pad = patch_size // 2
+
+    def get_rcp_map(self, x):
+        """
+        J_RED(x) = min( min(1-R), min(G), min(B) ) trong vùng lân cận Omega
+        """
+        # 1. Tách kênh (Giả định input x là RGB)
+        r = x[:, 0:1, :, :]
+        g = x[:, 1:2, :, :]
+        b = x[:, 2:3, :, :]
+
+        # 2. Tạo các thành phần so sánh: 1-R, G, B 
+        # Kênh đỏ bị suy giảm mạnh nhất -> dùng 1-R để khôi phục quan hệ độ sâu
+        r_inv = 1.0 - r
+        
+        # 3. Tìm Min giữa các kênh (Channel-wise Min)
+        # min_val shape: [B, 1, H, W]
+        min_val = torch.min(r_inv, torch.min(g, b))
+
+        # 4. Tìm Min trong vùng lân cận (Spatial Min Pooling - Omega(x))
+        # Dùng MaxPool với giá trị âm để mô phỏng MinPool
+        rcp = -F.max_pool2d(-min_val, kernel_size=self.patch_size, stride=1, padding=self.pad)
+        
+        return rcp
+
+    def forward(self, x):
+        # Bước 1: Tính bản đồ Prior thô (1 kênh)
+        prior_map = self.get_rcp_map(x) # Shape: [B, 1, H, W]
+
+        # Bước 2: Mở rộng kích thước để khớp với đầu vào của NAFBlock
+        # Code gốc: x_mean.expand_as(x) -> Biến 1 kênh thành 3 kênh giống nhau
+        # Ta làm tương tự với prior_map
+        prior_expanded = prior_map.expand_as(x) # Shape: [B, 3, H, W]
+
+        # Bước 3: Đưa qua NAFBlock để trích xuất đặc trưng ngữ cảnh
+        prior_out = self.enc(prior_expanded)
+
+        return prior_out
+
 
 class PriorGuidedRE(nn.Module):
     def __init__(self, ch_in=3, down_depth=2):
@@ -1211,7 +1312,7 @@ class Model(nn.Module):
         self.ch_in = 3
         self.down_depth = 2
 
-        self.prior = ColorBalancePrior(self.ch_in)
+        self.prior = RedChannelPrior(self.ch_in)
         self.re = PriorGuidedRE(self.ch_in, self.down_depth)
 
     def forward(self, x):
