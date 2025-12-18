@@ -9,7 +9,7 @@ from numpy.random import RandomState
 from scipy.stats import chi
 
 
-class FeatureContextualizer(nn.Module):
+'''class FeatureContextualizer(nn.Module):
     def __init__(self, ch_in=3, dim=16, ch_out=6):
         super(FeatureContextualizer, self).__init__()
 
@@ -36,6 +36,61 @@ class FeatureContextualizer(nn.Module):
 
         x_1 = self.block2_1(x1, prior_embed)
         x_2 = self.block2_2(x_1, x_1)
+        x2 = self.agg2(torch.cat((x1, x_1, x_2), dim=1))
+
+        out = self.spp(x2)
+
+        return out'''
+
+class FeatureContextualizer(nn.Module):
+    def __init__(self, ch_in=3, dim=16, ch_out=6):
+        super(FeatureContextualizer, self).__init__()
+
+        self.embed = OverlapPatchEmbed(ch_in, dim)
+        self.embed_prior = OverlapPatchEmbed(ch_in, dim) # RCP input
+
+        # --- GIAI ĐOẠN 1 ---
+        # Block 1_1: Dùng SFT để đưa RCP vào (Guidance)
+        self.block1_1 = MAQ_SFT(dim)
+        # Block 1_2: Chỉ tinh chỉnh feature (Refinement)
+        self.block1_2 = MAQ_Refine(dim)
+        
+        self.agg1 = Aggreation(dim * 2, dim)
+
+        # --- GIAI ĐOẠN 2 ---
+        # Block 2_1: Tiếp tục dùng SFT để đưa RCP vào ở mức sâu hơn (Guidance)
+        self.block2_1 = MAQ_SFT(dim)
+        # Block 2_2: Tinh chỉnh tiếp (Refinement)
+        self.block2_2 = MAQ_Refine(dim)
+        
+        self.agg2 = Aggreation(dim * 3, dim)
+
+        self.spp = SPP(dim, ch_out)
+
+    def forward(self, x, prior):
+        # Embedding
+        x = self.embed(x)
+        prior_embed = self.embed_prior(prior)
+
+        # --- Stage 1 Flow ---
+        # 1.1: SFT Modulation (Truyền cả x và prior)
+        x_1 = self.block1_1(x, prior_embed) 
+        
+        # 1.2: Self Refinement (Chỉ truyền x_1)
+        # Lưu ý: Code gốc truyền (x_1, x_1), giờ ta chỉ cần truyền (x_1)
+        x_2 = self.block1_2(x_1)            
+        
+        # Aggregation
+        x1 = self.agg1(torch.cat((x_1, x_2), dim=1))
+
+        # --- Stage 2 Flow ---
+        # 2.1: SFT Modulation (Feature tầng 1 + Prior)
+        x_1 = self.block2_1(x1, prior_embed)
+        
+        # 2.2: Self Refinement
+        x_2 = self.block2_2(x_1)
+        
+        # Final Aggregation
         x2 = self.agg2(torch.cat((x1, x_1, x_2), dim=1))
 
         out = self.spp(x2)
@@ -986,19 +1041,12 @@ class SFTLayer(nn.Module):
         # Công thức SFT: F = F * (1 + scale) + shift
         return x * (1 + scale) + shift
 
-class MAQ(nn.Module):
+# Loại 1: Khối SFT-MAQ (Bạn đã có, dùng để tiếp nhận Prior)
+class MAQ_SFT(nn.Module):
     def __init__(self, dim):
-        super(MAQ, self).__init__()
-        
-        # 1. Giữ lại Branch 3: Self-Attention Transformer
-        # Giúp ảnh tự học mối quan hệ xa gần trong chính nó
-        self.self_attn = SelfAttentionTransformer(dim) 
-        
-        # 2. Thay Branch 1 & 2 bằng SFT Layer
-        # Nơi RCP (Prior) điều khiển việc khôi phục ảnh
+        super(MAQ_SFT, self).__init__()
+        self.self_attn = SelfAttentionTransformer(dim)
         self.sft = SFTLayer(dim)
-        
-        # 3. Khối xử lý sau cùng (thay cho QCNN phức tạp cũ)
         self.final_conv = nn.Sequential(
             nn.Conv2d(dim, dim, 3, 1, 1),
             nn.BatchNorm2d(dim),
@@ -1006,21 +1054,32 @@ class MAQ(nn.Module):
         )
 
     def forward(self, x, prior):
-        # Bước 1: Ảnh tự tăng cường đặc trưng bản thân (Logic của Branch 3 cũ)
+        # Self-Attention trước để hiểu cấu trúc
         x_self = self.self_attn(x)
-        
-        # Bước 2: Dùng Prior để điều biến đặc trưng ảnh (Logic SFT thay cho Branch 1)
-        # Tại đây, thông tin vật lý từ RCP (độ sâu) được "tiêm" vào feature map
+        # SFT dùng Prior để điều biến
         x_sft = self.sft(x_self, prior)
+        # Residual + Final Conv
+        return self.final_conv(x + x_sft)
+
+# Loại 2: Khối Refinement (Chỉ dùng Self-Attention, không cần Prior)
+class MAQ_Refine(nn.Module):
+    def __init__(self, dim):
+        super(MAQ_Refine, self).__init__()
+        # Chỉ cần Self-Attention Transformer là đủ mạnh để tinh chỉnh
+        self.self_attn = SelfAttentionTransformer(dim)
         
-        # Bước 3: Residual Connection
-        # Cộng gộp với input ban đầu để giữ thông tin gốc
-        out = x + x_sft
-        
-        # Tinh chỉnh cuối cùng
-        out = self.final_conv(out)
-        
-        return out
+        # Có thể thêm 1 lớp Conv nhẹ để trộn kênh nếu muốn
+        self.process = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.BatchNorm2d(dim),
+            nn.SiLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # Chỉ xử lý x, không quan tâm prior
+        x_attn = self.self_attn(x)
+        return self.process(x + x_attn) # Residual Connection
+    
 
 
 class QBlock(nn.Module):
